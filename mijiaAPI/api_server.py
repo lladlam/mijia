@@ -1,11 +1,13 @@
 import base64
-import ipaddress
 import hashlib
+import io
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
+import struct
 import threading
 import time
 import uuid
@@ -24,7 +26,9 @@ from Crypto.Random import get_random_bytes
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from PIL import Image
 from pydantic import BaseModel
+from qrcode import QRCode
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -922,6 +926,150 @@ class SessionStore:
             encoding="utf-8",
         )
 
+    def get_login_qr_png(self, login_session_id: str, client_ip: str) -> bytes:
+        """Encode the Xiaomi Passport long-poll URL as a local QR image."""
+        self._validated_login_session_id(login_session_id)
+        self._assert_login_owner(login_session_id, client_ip)
+        state = self._read_task_state(login_session_id)
+        login_url = str(state.get("login_url", ""))
+        parsed_url = parse.urlparse(login_url)
+        hostname = (parsed_url.hostname or "").lower()
+        if parsed_url.scheme != "https" or not (
+            hostname == "account.xiaomi.com"
+            or hostname.endswith(".account.xiaomi.com")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="米家返回了不受信任的登录地址",
+            )
+
+        cache_path = self._task_dir(login_session_id) / "login-qr.png"
+        if cache_path.exists():
+            content = cache_path.read_bytes()
+        else:
+            try:
+                qr = QRCode(border=4, box_size=1)
+                qr.add_data(login_url)
+                qr.make(fit=True)
+                source = qr.make_image(
+                    fill_color="black", back_color="white"
+                ).get_image().convert("1")
+                if source.width > 240 or source.height > 240:
+                    raise ValueError("二维码矩阵超过显示区域")
+                scale = min(240 // source.width, 240 // source.height)
+                scaled = source.resize(
+                    (source.width * scale, source.height * scale),
+                    Image.Resampling.NEAREST,
+                )
+                canvas = Image.new("1", (240, 240), color=1)
+                canvas.paste(
+                    scaled,
+                    ((240 - scaled.width) // 2, (240 - scaled.height) // 2),
+                )
+                output = io.BytesIO()
+                canvas.save(output, format="PNG", optimize=False)
+                content = output.getvalue()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="登录二维码生成失败",
+                ) from exc
+            if len(content) > 256 * 1024:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="二维码图片超过大小限制",
+                )
+            cache_path.write_bytes(content)
+
+        if len(content) < 24 or content[:8] != b"\x89PNG\r\n\x1a\n":
+            cache_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="二维码响应不是有效 PNG 图片",
+            )
+        return content
+
+    def get_login_qr_i1(self, login_session_id: str, client_ip: str) -> bytes:
+        """Return the cached QR image in a compact LVGL I1 wire format."""
+        png = self.get_login_qr_png(login_session_id, client_ip)
+        width = 240
+        height = 240
+        stride = 32
+
+        try:
+            with Image.open(io.BytesIO(png)) as source:
+                image = source.convert("L")
+                if image.size != (width, height):
+                    image = image.resize((width, height), Image.Resampling.NEAREST)
+                image = image.point(lambda value: 255 if value >= 128 else 0, mode="1")
+                packed = image.tobytes()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="二维码图片转换失败",
+            ) from exc
+
+        row_bytes = (width + 7) // 8
+        if len(packed) != row_bytes * height:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="二维码图片尺寸异常",
+            )
+
+        pixels = bytearray(b"\xff" * (stride * height))
+        for row in range(height):
+            source_offset = row * row_bytes
+            target_offset = row * stride
+            pixels[target_offset : target_offset + row_bytes] = packed[
+                source_offset : source_offset + row_bytes
+            ]
+
+        # HQR1 + big-endian dimensions + I1 format. LVGL's indexed image
+        # data begins with two BGRA palette entries: black and white.
+        header = struct.pack(">4sHHHBB", b"HQR1", width, height, stride, 1, 0)
+        palette = b"\x00\x00\x00\xff\xff\xff\xff\xff"
+        return header + palette + bytes(pixels)
+
+    def get_login_qr_rgb565(self, login_session_id: str, client_ip: str) -> bytes:
+        """Return the cached QR image as native little-endian RGB565 pixels."""
+        png = self.get_login_qr_png(login_session_id, client_ip)
+        width = 240
+        height = 240
+        stride = width * 2
+
+        try:
+            with Image.open(io.BytesIO(png)) as source:
+                image = source.convert("L")
+                if image.size != (width, height):
+                    image = image.resize((width, height), Image.Resampling.NEAREST)
+                mono = image.point(lambda value: 255 if value >= 128 else 0, mode="1")
+                packed = mono.tobytes()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="二维码图片转换失败",
+            ) from exc
+
+        row_bytes = (width + 7) // 8
+        if len(packed) != row_bytes * height:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="二维码图片尺寸异常",
+            )
+
+        pixels = bytearray(stride * height)
+        for y in range(height):
+            for x in range(width):
+                source_byte = packed[y * row_bytes + x // 8]
+                white = source_byte & (0x80 >> (x % 8))
+                offset = y * stride + x * 2
+                if white:
+                    pixels[offset] = 0xFF
+                    pixels[offset + 1] = 0xFF
+
+        header = struct.pack(">4sHHHBB", b"HQR2", width, height, stride, 2, 0)
+        return header + bytes(pixels)
+
     def _store_terminal_login_state(self, login_session_id: str, payload: dict[str, Any]) -> None:
         terminal_payload = dict(payload)
         terminal_payload.setdefault("session_id", login_session_id)
@@ -1002,25 +1150,77 @@ class SessionStore:
                 max_retries=self.retry_config.max_retries,
                 retry_delay=self.retry_config.retry_delay,
             )
-            location_data = api._get_location()
-            if location_data.get("code", -1) == 0 and location_data.get("message", "") == "刷新Token成功":
-                raise LoginError(-1, "当前登录流程无现成 token，请重新扫码登录")
-
-            location_data.update({
-                "theme": "",
-                "bizDeviceType": "",
-                "_hasLogo": "false",
-                "_qrsize": "240",
-                "_dc": str(int(time.time() * 1000)),
-            })
+            login_http = requests.Session()
             headers = {
                 "User-Agent": api.user_agent,
                 "Accept-Encoding": "gzip",
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Connection": "keep-alive",
             }
+            service_headers = dict(headers)
+            service_headers["Cookie"] = (
+                f"deviceId={api.deviceId};"
+                "sdkVersion=3.4.1;"
+                f"pass_o={api.pass_o};"
+                f"uLocale={api.locale};"
+            )
+            service_ret = self._http_get_with_retry(
+                api.service_login_url,
+                headers=service_headers,
+                session=login_http,
+            )
+            service_data = api._handle_ret(service_ret, verify_code=False)
+            location = str(service_data.get("location", ""))
+            if not location:
+                raise LoginError(-1, "米家登录响应缺少 location")
+
+            location_query = {
+                key: values[0]
+                for key, values in parse.parse_qs(
+                    parse.urlparse(location).query
+                ).items()
+            }
+            required_fields = ("qs", "_sign", "callback")
+            missing_fields = [
+                field for field in required_fields
+                if not service_data.get(field) and not location_query.get(field)
+            ]
+            if missing_fields:
+                raise LoginError(
+                    -1,
+                    "米家登录响应缺少字段: " + ", ".join(missing_fields),
+                )
+
+            location_data = {
+                "_qrsize": "240",
+                "qs": service_data.get("qs") or location_query["qs"],
+                "bizDeviceType": "",
+                "callback": (
+                    service_data.get("callback")
+                    or location_query["callback"]
+                ),
+                "_json": "true",
+                "theme": "",
+                "sid": service_data.get("sid", "mijia"),
+                "needTheme": "false",
+                "showActiveX": "false",
+                "serviceParam": (
+                    service_data.get("serviceParam")
+                    or location_query.get("serviceParam", "")
+                ),
+                "_locale": api.locale,
+                "_sign": service_data.get("_sign") or location_query["_sign"],
+                "_hasLogo": "false",
+                "_dc": str(int(time.time() * 1000)),
+            }
             url = api.login_url + "?" + parse.urlencode(location_data)
-            login_ret = self._http_get_with_retry(url, headers=headers)
+            qr_headers = dict(headers)
+            qr_headers["Referer"] = api.service_login_url
+            login_ret = self._http_get_with_retry(
+                url,
+                headers=qr_headers,
+                session=login_http,
+            )
             login_data = api._handle_ret(login_ret)
             payload = {
                 "session_id": login_session_id,
@@ -1036,7 +1236,13 @@ class SessionStore:
             self._write_task_state(login_session_id, payload)
             thread = threading.Thread(
                 target=self._complete_login,
-                args=(login_session_id, api, headers, login_data["lp"]),
+                args=(
+                    login_session_id,
+                    api,
+                    qr_headers,
+                    login_data["lp"],
+                    login_http,
+                ),
                 daemon=True,
             )
             thread.start()
@@ -1062,6 +1268,7 @@ class SessionStore:
         api: mijiaAPI,
         headers: dict[str, str],
         long_poll_url: str,
+        session: requests.Session,
     ) -> None:
         try:
             with self._login_task_lock:
@@ -1076,7 +1283,6 @@ class SessionStore:
                 self._cleanup_login_task(login_session_id)
                 return
 
-            session = requests.Session()
             lp_ret = session.get(long_poll_url, headers=headers, timeout=self.retry_config.login_timeout)
             lp_data = api._handle_ret(lp_ret)
             for key in ["psecurity", "nonce", "ssecurity", "passToken", "userId", "cUserId"]:
@@ -1641,6 +1847,48 @@ def create_app(config: ServerConfig) -> FastAPI:
         __: None = Depends(enforce_public_rate_limit),
     ):
         return store.get_login_status(session_id, request.state.client_ip)
+
+    @app.get("/api/login/qr.png")
+    def login_qr_png(
+        request: Request,
+        session_id: str,
+        _: None = Depends(request_slot),
+        __: None = Depends(enforce_public_rate_limit),
+    ):
+        content = store.get_login_qr_png(session_id, request.state.client_ip)
+        return Response(
+            content=content,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/login/qr.i1")
+    def login_qr_i1(
+        request: Request,
+        session_id: str,
+        _: None = Depends(request_slot),
+        __: None = Depends(enforce_public_rate_limit),
+    ):
+        content = store.get_login_qr_i1(session_id, request.state.client_ip)
+        return Response(
+            content=content,
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/login/qr.rgb565")
+    def login_qr_rgb565(
+        request: Request,
+        session_id: str,
+        _: None = Depends(request_slot),
+        __: None = Depends(enforce_public_rate_limit),
+    ):
+        content = store.get_login_qr_rgb565(session_id, request.state.client_ip)
+        return Response(
+            content=content,
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/api/login/claim")
     def login_claim(
