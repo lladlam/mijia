@@ -157,7 +157,7 @@ class mijiaDevice():
         logger.debug(f"获取属性: {self.name} -> {name}, 结果: {result}")
         return result["value"]
 
-    def set(self, name: str, value: Union[bool, int, float, str]):
+    def set(self, name: str, value: Union[bool, int, float, str]) -> dict[str, Any]:
         if name not in self.prop_list:
             raise ValueError(f"不支持的属性: {name}, 可用属性: {list(self.prop_list.keys())}")
         prop = self.prop_list[name]
@@ -218,6 +218,7 @@ class mijiaDevice():
             raise DeviceSetError(self.name, name, result["code"])
         time.sleep(self.sleep_time)
         logger.debug(f"设置属性: {self.name} -> {name}, 值: {value}, 结果: {result}")
+        return result
 
     def __getattr__(self, name: str) -> Union[bool, int, float, str]:
         if "prop_list" in self.__dict__ and name in self.prop_list:
@@ -236,7 +237,7 @@ class mijiaDevice():
             name: str,
             value: Optional[Union[list, tuple]] = None,
             **kwargs
-    ):
+    ) -> dict[str, Any]:
         if name not in self.action_list:
             raise ValueError(f"不支持的动作: {name}, 可用动作: {list(self.action_list.keys())}")
         act = self.action_list[name]
@@ -258,6 +259,7 @@ class mijiaDevice():
             raise DeviceActionError(self.name, name, result["code"])
         time.sleep(self.sleep_time)
         logger.debug(f"执行动作: {self.name} -> {name}, 结果: {result}")
+        return result
 
 
 def get_device_info(
@@ -306,14 +308,18 @@ def get_device_info(
     """
     if cache_backend is not None:
         cached = cache_backend.get(device_model)
-        if cached is not None:
+        if cached is not None and all(
+            "notifiable" in prop for prop in cached.get("properties", [])
+        ):
             return cached
     elif cache_path is not None:
         cache_file = Path(cache_path) / f"{device_model}.json"
         if cache_file.exists():
             logger.debug(f"从缓存加载设备信息: {cache_file}")
             with cache_file.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
+            if all("notifiable" in prop for prop in cached.get("properties", [])):
+                return cached
     timeout = float(os.getenv("MIJIA_REQUEST_TIMEOUT", "10"))
     retries = int(os.getenv("MIJIA_REQUEST_RETRIES", "2"))
     retry_delay = float(os.getenv("MIJIA_REQUEST_RETRY_DELAY", "0.5"))
@@ -349,7 +355,7 @@ def get_device_info(
     product = content["props"]["product"]
     name = product["name"]
     model = product["model"]
-    i18n_zh = content["props"]["i18n"]["zh_cn"]
+    i18n_zh = content["props"].get("i18n", {}).get("zh_cn", {})
     result = {
         "name": name,
         "model": model,
@@ -381,6 +387,7 @@ def get_device_info(
                 "description": f"{prop['description']} / {zh_cn}".rstrip(" / "),
                 "type": prop_type,
                 "rw": access_str,
+                "notifiable": "notify" in prop["access"],
                 "range": prop.get("valueRange", None),
                 "value-list": None,
                 "method": {

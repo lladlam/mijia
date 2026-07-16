@@ -3,6 +3,7 @@ import hashlib
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -55,6 +56,7 @@ class DevicePropertyPayload(BaseModel):
 class DeviceActionPayload(BaseModel):
     did: str
     action_name: str
+    arguments: tuple[Any, ...] = ()
 
 
 class SceneRunPayload(BaseModel):
@@ -107,6 +109,9 @@ class ServerConfig:
 SESSION_READ_CACHE_TTL_SECONDS = 3.0
 SESSION_DEVICE_DETAIL_CACHE_TTL_SECONDS = 2.0
 SESSION_META_TOUCH_INTERVAL_SECONDS = 15.0
+SYNC_SNAPSHOT_REUSE_SECONDS = 2.0
+PROPERTY_CONFIRM_TIMEOUT_SECONDS = 4.0
+PROPERTY_CONFIRM_INTERVAL_SECONDS = 0.25
 
 
 def _env_truthy(value: str) -> bool:
@@ -488,6 +493,7 @@ class ManagedSession:
         self.lock = threading.RLock()
         self._meta_lock = threading.RLock()
         self._runtime_cache_lock = threading.RLock()
+        self._sync_lock = threading.RLock()
         self._touch_lock = threading.RLock()
         self._api: Optional[mijiaAPI] = None
         self._auth_data: Optional[dict[str, Any]] = None
@@ -497,6 +503,11 @@ class ManagedSession:
         self._last_touch_monotonic = 0.0
         self._meta_cache: Optional[dict[str, Any]] = None
         self._runtime_cache: dict[str, tuple[float, Any]] = {}
+        self._sync_revision = 0
+        self._sync_state: Optional[dict[str, Any]] = None
+        self._sync_last_event: Optional[dict[str, Any]] = None
+        self._sync_snapshot: Optional[dict[str, Any]] = None
+        self._sync_snapshot_monotonic = 0.0
         self._device_spec_cache = EncryptedDeviceSpecCache(
             token_hash=token_hash,
             cache_dir=self.cache_path,
@@ -675,6 +686,7 @@ class ManagedSession:
         self._vault_salt = None
         self._vault_iterations = VAULT_PBKDF2_ITERATIONS
         self.invalidate_runtime_cache()
+        self.reset_sync_state()
 
     def set_vault_password(self, password: str) -> None:
         meta = self.read_meta()
@@ -734,7 +746,74 @@ class ManagedSession:
         self._vault_salt = None
         self._vault_iterations = VAULT_PBKDF2_ITERATIONS
         self.invalidate_runtime_cache()
+        self.reset_sync_state()
         self.device_spec_cache.clear_hot_cache()
+
+    def reset_sync_state(self) -> None:
+        with self._sync_lock:
+            self._sync_revision = 0
+            self._sync_state = None
+            self._sync_last_event = None
+            self._sync_snapshot = None
+            self._sync_snapshot_monotonic = 0.0
+
+    def update_sync_state(self, snapshot: dict[str, Any]) -> tuple[int, Optional[dict[str, Any]]]:
+        state = _extract_sync_state(snapshot)
+        with self._sync_lock:
+            self._sync_snapshot = snapshot
+            self._sync_snapshot_monotonic = time.monotonic()
+            if self._sync_state is None:
+                self._sync_revision = 1
+                self._sync_state = state
+                self._sync_last_event = None
+                return self._sync_revision, None
+
+            changes, resync_required = _build_sync_delta(self._sync_state, state)
+            self._sync_state = state
+            if not changes and not resync_required:
+                return self._sync_revision, None
+
+            self._sync_revision += 1
+            event = {
+                "revision": self._sync_revision,
+                "generated_at": int(time.time()),
+                "resync_required": resync_required,
+                "changes": changes,
+            }
+            self._sync_last_event = event
+            return self._sync_revision, event
+
+    def get_recent_sync_snapshot(
+        self,
+        max_age_seconds: float = SYNC_SNAPSHOT_REUSE_SECONDS,
+    ) -> tuple[Optional[dict[str, Any]], int]:
+        with self._sync_lock:
+            if (
+                self._sync_snapshot is None
+                or time.monotonic() - self._sync_snapshot_monotonic > max_age_seconds
+            ):
+                return None, self._sync_revision
+            return dict(self._sync_snapshot), self._sync_revision
+
+    def invalidate_sync_snapshot(self) -> None:
+        with self._sync_lock:
+            self._sync_snapshot = None
+            self._sync_snapshot_monotonic = 0.0
+
+    def get_sync_event_after(self, revision: int) -> tuple[int, Optional[dict[str, Any]], bool]:
+        with self._sync_lock:
+            current = self._sync_revision
+            if self._sync_state is None:
+                return current, None, True
+            if revision == current:
+                return current, None, False
+            if (
+                self._sync_last_event is not None
+                and self._sync_last_event["revision"] == current
+                and revision == current - 1
+            ):
+                return current, dict(self._sync_last_event), False
+            return current, None, True
 
     def touch(self) -> None:
         now = time.monotonic()
@@ -1584,8 +1663,11 @@ def build_device_detail(session: ManagedSession, did: str) -> dict[str, Any]:
         properties.append({
             "name": prop["name"],
             "description": prop.get("description", ""),
+            "siid": prop["method"]["siid"],
+            "piid": prop["method"]["piid"],
             "type": prop.get("type", ""),
             "rw": prop.get("rw", ""),
+            "notifiable": bool(prop.get("notifiable", False)),
             "range": prop.get("range"),
             "value_list": prop.get("value-list"),
             "readable": "r" in prop.get("rw", ""),
@@ -1598,6 +1680,8 @@ def build_device_detail(session: ManagedSession, did: str) -> dict[str, Any]:
         {
             "name": action["name"],
             "description": action.get("description", ""),
+            "siid": action["method"]["siid"],
+            "aiid": action["method"]["aiid"],
         }
         for action in info.get("actions", [])
     ]
@@ -1615,6 +1699,263 @@ def build_device_detail(session: ManagedSession, did: str) -> dict[str, Any]:
 
 def get_device_detail_cached(session: ManagedSession, did: str) -> dict[str, Any]:
     return session.get_cached_device_detail(did, lambda: build_device_detail(session, did))
+
+
+def classify_device_type(device: dict[str, Any]) -> str:
+    """Return a stable UI category from model and MIoT capabilities."""
+
+    model = str(device.get("model", "")).lower()
+    name = str(device.get("name", "")).lower()
+    properties = {item.get("name", "") for item in device.get("properties", [])}
+    actions = {item.get("name", "") for item in device.get("actions", [])}
+
+    if ".wifispeaker." in model or {"play", "pause"} <= actions:
+        return "speaker"
+    if ".heater." in model or "target-temperature" in properties:
+        return "heater"
+    if ".plug." in model or "power-consumption" in properties:
+        return "outlet"
+    if ".light." in model or {"brightness", "color-temperature"} <= properties:
+        return "light"
+    if ".magnet." in model or "contact-state" in properties:
+        return "contact-sensor"
+    if ".sensor_ht." in model or {"temperature", "relative-humidity"} <= properties:
+        return "environment-sensor"
+    if model.startswith("miir.tv."):
+        return "television-remote"
+    if model.startswith("miir.stb."):
+        return "set-top-box-remote"
+    if ".switch." in model or "toggle" in actions:
+        return "switch"
+    if ".treadmill." in model:
+        return "treadmill"
+    if ".watch." in model:
+        return "wearable"
+    if ".fitting." in model or "tag" in name:
+        return "tracker"
+    return "device"
+
+
+def build_family_snapshot(session: ManagedSession) -> dict[str, Any]:
+    """Build one consistent, board-friendly view of the Mijia account."""
+
+    api = session.load_api()
+    homes_list = session.get_cached_homes_list(api)
+    devices_list = session.get_cached_devices_list(api)
+    scenes_list = session.get_cached_scenes_list(api)
+
+    homes = []
+    home_names: dict[str, str] = {}
+    device_rooms: dict[str, tuple[str, str]] = {}
+    for home in homes_list:
+        home_id = str(home.get("id", ""))
+        home_name = str(home.get("name", ""))
+        home_names[home_id] = home_name
+        rooms = []
+        for room in home.get("roomlist", []) or []:
+            room_id = str(room.get("id", ""))
+            room_name = str(room.get("name", ""))
+            dids = [str(did) for did in room.get("dids", []) or []]
+            for did in dids:
+                device_rooms[did] = (room_id, room_name)
+            rooms.append({
+                "id": room_id,
+                "name": room_name,
+                "dids": dids,
+                "create_time": room.get("create_time"),
+            })
+        homes.append({
+            "id": home_id,
+            "name": home_name,
+            "address": home.get("address", ""),
+            "create_time": home.get("create_time"),
+            "rooms": rooms,
+        })
+
+    devices = []
+    online_count = 0
+    detail_error_count = 0
+    for item in devices_list:
+        did = str(item["did"])
+        home_id = str(item.get("home_id", ""))
+        room_id, room_name = device_rooms.get(did, ("", ""))
+        online = bool(item.get("isOnline", False))
+        online_count += int(online)
+        try:
+            detail = get_device_detail_cached(session, did)
+            properties = detail.get("properties", [])
+            actions = detail.get("actions", [])
+            detail_available = True
+        except Exception as exc:
+            did_hash = hashlib.sha256(did.encode("utf-8")).hexdigest()[:12]
+            logger.warning(
+                "聚合设备详情失败 did_hash=%s error=%s",
+                did_hash,
+                type(exc).__name__,
+            )
+            properties = []
+            actions = []
+            detail_available = False
+            detail_error_count += 1
+
+        device = {
+            "did": did,
+            "name": item.get("name", did),
+            "model": item.get("model", ""),
+            "home_id": home_id,
+            "home_name": home_names.get(
+                home_id,
+                "共享设备" if home_id == "shared" else "",
+            ),
+            "room_id": room_id,
+            "room_name": room_name,
+            "isOnline": online,
+            "detail_available": detail_available,
+            "properties": properties,
+            "actions": actions,
+        }
+        device["device_type"] = classify_device_type(device)
+        devices.append(device)
+
+    scenes = [
+        {
+            "scene_id": str(item["scene_id"]),
+            "name": item.get("name", ""),
+            "home_id": str(item.get("home_id", "")),
+            "home_name": home_names.get(str(item.get("home_id", "")), ""),
+            "create_time": item.get("create_time"),
+        }
+        for item in scenes_list
+    ]
+    room_count = sum(len(home["rooms"]) for home in homes)
+    return {
+        "generated_at": int(time.time()),
+        "protocol": {
+            "model": "MIoT-Spec-V2",
+            "control": "cloud-http-ot",
+            "event_source": "cloud-readback",
+            "mqtt_connected": False,
+        },
+        "summary": {
+            "home_count": len(homes),
+            "room_count": room_count,
+            "device_count": len(devices),
+            "online_count": online_count,
+            "scene_count": len(scenes),
+            "detail_error_count": detail_error_count,
+            "primary_home_name": homes[0]["name"] if homes else "",
+        },
+        "homes": homes,
+        "devices": devices,
+        "scenes": scenes,
+    }
+
+
+def _extract_sync_state(snapshot: dict[str, Any]) -> dict[str, Any]:
+    structure = {
+        "homes": sorted([
+            {
+                "id": home["id"],
+                "rooms": sorted([
+                    {"id": room["id"], "dids": sorted(room["dids"])}
+                    for room in home["rooms"]
+                ], key=lambda room: room["id"]),
+            }
+            for home in snapshot["homes"]
+        ], key=lambda home: home["id"]),
+        "devices": sorted([
+            {
+                "did": device["did"],
+                "model": device["model"],
+                "home_id": device["home_id"],
+                "room_id": device["room_id"],
+            }
+            for device in snapshot["devices"]
+        ], key=lambda device: device["did"]),
+        "scenes": sorted([
+            {"scene_id": scene["scene_id"], "home_id": scene["home_id"]}
+            for scene in snapshot["scenes"]
+        ], key=lambda scene: scene["scene_id"]),
+    }
+    devices = {}
+    for device in snapshot["devices"]:
+        properties = {}
+        for prop in device["properties"]:
+            if not prop.get("notifiable", False):
+                continue
+            key = f"{prop['siid']}:{prop['piid']}"
+            properties[key] = {
+                "siid": prop["siid"],
+                "piid": prop["piid"],
+                "value": _normalize_sync_value(prop.get("current_value")),
+                "error": _normalize_sync_value(prop.get("current_error")),
+            }
+        devices[device["did"]] = {
+            "online": device["isOnline"],
+            "properties": properties,
+        }
+    return {
+        "structure": json.dumps(structure, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        "devices": devices,
+    }
+
+
+def _normalize_sync_value(value: Any) -> Any:
+    """Make cloud values deterministic before comparing sync revisions."""
+
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_sync_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_sync_value(item) for item in value]
+    return value
+
+
+def _build_sync_delta(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    if previous["structure"] != current["structure"]:
+        return [], True
+
+    previous_devices = previous["devices"]
+    current_devices = current["devices"]
+    if previous_devices.keys() != current_devices.keys():
+        return [], True
+
+    online_changes = []
+    property_changes = []
+    for did, device in current_devices.items():
+        old_device = previous_devices[did]
+        if old_device["online"] != device["online"]:
+            online_changes.append({"did": did, "value": device["online"]})
+
+        old_properties = old_device["properties"]
+        properties = device["properties"]
+        if old_properties.keys() != properties.keys():
+            return [], True
+        for key, prop in properties.items():
+            old_prop = old_properties[key]
+            if old_prop["value"] == prop["value"] and old_prop["error"] == prop["error"]:
+                continue
+            property_changes.append({
+                "did": did,
+                "siid": prop["siid"],
+                "piid": prop["piid"],
+                "value": prop["value"],
+                "code": 0 if prop["error"] is None else -1,
+            })
+
+    changes = []
+    if online_changes:
+        changes.append({"method": "device_online_changed", "params": online_changes})
+    if property_changes:
+        changes.append({"method": "properties_changed", "params": property_changes})
+    return changes, False
 
 
 def create_app(config: ServerConfig) -> FastAPI:
@@ -1657,6 +1998,7 @@ def create_app(config: ServerConfig) -> FastAPI:
     )
     read_rate_limit = int(os.getenv("MIJIA_READ_RATE_LIMIT", "240"))
     write_rate_limit = int(os.getenv("MIJIA_WRITE_RATE_LIMIT", "60"))
+    sync_poll_seconds = max(1.0, min(10.0, float(os.getenv("MIJIA_SYNC_POLL_SECONDS", "3"))))
 
     def request_slot(request: Request):
         queue_started_at = time.perf_counter()
@@ -2043,6 +2385,73 @@ def create_app(config: ServerConfig) -> FastAPI:
         with _timed_session_lock(session, "device_detail"):
             return {"device": get_device_detail_cached(session, did)}
 
+    @app.get("/api/sync")
+    def family_sync(
+        session: ManagedSession = Depends(enforce_read_rate_limit),
+        _: None = Depends(request_slot),
+    ):
+        with _timed_session_lock(session, "family_sync"):
+            snapshot, revision = session.get_recent_sync_snapshot()
+            if snapshot is None:
+                snapshot = build_family_snapshot(session)
+                revision, _ = session.update_sync_state(snapshot)
+            snapshot["sync_revision"] = revision
+            return snapshot
+
+    @app.get("/api/sync/changes")
+    def family_sync_changes(
+        after: int = 0,
+        timeout: int = 8,
+        session: ManagedSession = Depends(enforce_read_rate_limit),
+        _: None = Depends(request_slot),
+    ):
+        timeout = max(1, min(10, timeout))
+        deadline = time.monotonic() + timeout
+        stale = False
+
+        revision, event, resync_required = session.get_sync_event_after(max(0, after))
+        if resync_required:
+            return {
+                "revision": revision,
+                "generated_at": int(time.time()),
+                "resync_required": True,
+                "changes": [],
+                "timed_out": False,
+                "stale": False,
+            }
+        if event is not None:
+            return {**event, "timed_out": False, "stale": False}
+
+        while time.monotonic() < deadline:
+            try:
+                with _timed_session_lock(session, "family_sync_changes"):
+                    snapshot = build_family_snapshot(session)
+                revision, event = session.update_sync_state(snapshot)
+                if event is not None:
+                    return {**event, "timed_out": False, "stale": False}
+            except HTTPException:
+                raise
+            except Exception as exc:
+                stale = True
+                logger.warning("增量同步探测失败 error=%s", type(exc).__name__)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(sync_poll_seconds, remaining))
+
+        revision, event, resync_required = session.get_sync_event_after(max(0, after))
+        if event is not None:
+            return {**event, "timed_out": False, "stale": stale}
+        return {
+            "revision": revision,
+            "generated_at": int(time.time()),
+            "resync_required": resync_required,
+            "changes": [],
+            "timed_out": True,
+            "stale": stale,
+        }
+
     @app.post("/api/device/property")
     def set_device_property(
         payload: DevicePropertyPayload,
@@ -2063,12 +2472,49 @@ def create_app(config: ServerConfig) -> FastAPI:
                 device_info=info,
                 sleep_time=0.0,
             )
-            device.set(payload.prop_name, payload.value)
+            prop = device.prop_list.get(payload.prop_name)
+            if prop is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="设备不支持该属性",
+                )
+            result = device.set(payload.prop_name, payload.value)
+            code = int(result.get("code", 0))
+            accepted = code in (0, 1)
+            confirmed = False
+            current_value: Any = None
+            confirmation = "rpc-rejected"
+            deadline = time.monotonic() + PROPERTY_CONFIRM_TIMEOUT_SECONDS
+
+            if accepted and "r" in prop.rw:
+                confirmation = "readback-timeout"
+                while time.monotonic() < deadline:
+                    try:
+                        current_value = device.get(payload.prop_name)
+                        if current_value == payload.value:
+                            confirmed = True
+                            confirmation = "cloud-readback"
+                            break
+                    except (DeviceGetError, APIError):
+                        pass
+                    time.sleep(PROPERTY_CONFIRM_INTERVAL_SECONDS)
+            elif accepted:
+                confirmation = "rpc-only"
+
             session.invalidate_runtime_cache(f"device_detail:{payload.did}")
+            session.invalidate_sync_snapshot()
             return {
                 "did": payload.did,
                 "prop_name": payload.prop_name,
                 "value": payload.value,
+                "method": "set_properties",
+                "siid": prop.method["siid"],
+                "piid": prop.method["piid"],
+                "code": code,
+                "accepted": accepted,
+                "confirmed": confirmed,
+                "current_value": current_value,
+                "confirmation": confirmation,
             }
 
     @app.post("/api/device/action")
@@ -2091,11 +2537,20 @@ def create_app(config: ServerConfig) -> FastAPI:
                 device_info=info,
                 sleep_time=0.0,
             )
-            device.run_action(payload.action_name)
+            result = device.run_action(
+                payload.action_name,
+                _in=list(payload.arguments),
+            )
+            code = int(result.get("code", 0))
             session.invalidate_runtime_cache(f"device_detail:{payload.did}")
+            session.invalidate_sync_snapshot()
             return {
                 "did": payload.did,
                 "action_name": payload.action_name,
+                "method": "action",
+                "code": code,
+                "accepted": code in (0, 1),
+                "confirmed": code == 0,
             }
 
     @app.post("/api/scenes/run")
@@ -2112,10 +2567,13 @@ def create_app(config: ServerConfig) -> FastAPI:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="场景不存在")
             result = api.run_scene(target["scene_id"], target["home_id"])
             session.invalidate_runtime_cache()
+            session.invalidate_sync_snapshot()
             return {
                 "scene_id": target["scene_id"],
                 "name": target["name"],
                 "result": result,
+                "method": "run_scene",
+                "accepted": True,
             }
 
     return app
