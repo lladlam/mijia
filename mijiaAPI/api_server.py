@@ -12,7 +12,7 @@ import struct
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +50,8 @@ class LoginStartResponse(BaseModel):
 class DevicePropertyPayload(BaseModel):
     did: str
     prop_name: str
+    siid: Optional[int] = None
+    piid: Optional[int] = None
     value: Any = None
 
 
@@ -110,6 +112,7 @@ SESSION_READ_CACHE_TTL_SECONDS = 3.0
 SESSION_DEVICE_DETAIL_CACHE_TTL_SECONDS = 2.0
 SESSION_META_TOUCH_INTERVAL_SECONDS = 15.0
 SYNC_SNAPSHOT_REUSE_SECONDS = 2.0
+SYNC_EVENT_HISTORY_LIMIT = 64
 PROPERTY_CONFIRM_TIMEOUT_SECONDS = 4.0
 PROPERTY_CONFIRM_INTERVAL_SECONDS = 0.25
 
@@ -506,6 +509,9 @@ class ManagedSession:
         self._sync_revision = 0
         self._sync_state: Optional[dict[str, Any]] = None
         self._sync_last_event: Optional[dict[str, Any]] = None
+        self._sync_events: deque[dict[str, Any]] = deque(
+            maxlen=SYNC_EVENT_HISTORY_LIMIT
+        )
         self._sync_snapshot: Optional[dict[str, Any]] = None
         self._sync_snapshot_monotonic = 0.0
         self._device_spec_cache = EncryptedDeviceSpecCache(
@@ -754,6 +760,7 @@ class ManagedSession:
             self._sync_revision = 0
             self._sync_state = None
             self._sync_last_event = None
+            self._sync_events.clear()
             self._sync_snapshot = None
             self._sync_snapshot_monotonic = 0.0
 
@@ -775,12 +782,14 @@ class ManagedSession:
 
             self._sync_revision += 1
             event = {
+                "base_revision": self._sync_revision - 1,
                 "revision": self._sync_revision,
                 "generated_at": int(time.time()),
                 "resync_required": resync_required,
                 "changes": changes,
             }
             self._sync_last_event = event
+            self._sync_events.append(event)
             return self._sync_revision, event
 
     def get_recent_sync_snapshot(
@@ -807,13 +816,25 @@ class ManagedSession:
                 return current, None, True
             if revision == current:
                 return current, None, False
-            if (
-                self._sync_last_event is not None
-                and self._sync_last_event["revision"] == current
-                and revision == current - 1
-            ):
-                return current, dict(self._sync_last_event), False
-            return current, None, True
+            pending = [
+                event for event in self._sync_events
+                if int(event["revision"]) > revision
+            ]
+            if not pending or int(pending[0]["base_revision"]) != revision:
+                return current, None, True
+            expected = revision
+            for event in pending:
+                if (
+                    int(event["base_revision"]) != expected
+                    or int(event["revision"]) != expected + 1
+                ):
+                    return current, None, True
+                expected += 1
+            if expected != current:
+                return current, None, True
+            if any(bool(event["resync_required"]) for event in pending):
+                return current, None, True
+            return current, _merge_sync_events(revision, pending), False
 
     def touch(self) -> None:
         now = time.monotonic()
@@ -1835,6 +1856,7 @@ def build_family_snapshot(session: ManagedSession) -> dict[str, Any]:
             "control": "cloud-http-ot",
             "event_source": "cloud-readback",
             "mqtt_connected": False,
+            "panel_sync": "miot-delta-v1",
         },
         "summary": {
             "home_count": len(homes),
@@ -1856,8 +1878,13 @@ def _extract_sync_state(snapshot: dict[str, Any]) -> dict[str, Any]:
         "homes": sorted([
             {
                 "id": home["id"],
+                "name": home["name"],
                 "rooms": sorted([
-                    {"id": room["id"], "dids": sorted(room["dids"])}
+                    {
+                        "id": room["id"],
+                        "name": room["name"],
+                        "dids": sorted(room["dids"]),
+                    }
                     for room in home["rooms"]
                 ], key=lambda room: room["id"]),
             }
@@ -1866,14 +1893,32 @@ def _extract_sync_state(snapshot: dict[str, Any]) -> dict[str, Any]:
         "devices": sorted([
             {
                 "did": device["did"],
+                "name": device["name"],
                 "model": device["model"],
                 "home_id": device["home_id"],
                 "room_id": device["room_id"],
+                "room_name": device["room_name"],
+                "device_type": device["device_type"],
+                "detail_available": device["detail_available"],
+                "properties": sorted([
+                    {
+                        "name": prop["name"],
+                        "siid": prop["siid"],
+                        "piid": prop["piid"],
+                        "rw": prop["rw"],
+                        "range": prop["range"],
+                    }
+                    for prop in device["properties"]
+                ], key=lambda prop: (prop["siid"], prop["piid"])),
             }
             for device in snapshot["devices"]
         ], key=lambda device: device["did"]),
         "scenes": sorted([
-            {"scene_id": scene["scene_id"], "home_id": scene["home_id"]}
+            {
+                "scene_id": scene["scene_id"],
+                "name": scene["name"],
+                "home_id": scene["home_id"],
+            }
             for scene in snapshot["scenes"]
         ], key=lambda scene: scene["scene_id"]),
     }
@@ -1881,7 +1926,10 @@ def _extract_sync_state(snapshot: dict[str, Any]) -> dict[str, Any]:
     for device in snapshot["devices"]:
         properties = {}
         for prop in device["properties"]:
-            if not prop.get("notifiable", False):
+            # The cloud readback path also observes readable properties that
+            # are not marked notify in some older product specifications.
+            # They use the same MIoT delta envelope for the panel transport.
+            if not prop.get("readable", False):
                 continue
             key = f"{prop['siid']}:{prop['piid']}"
             properties[key] = {
@@ -1932,7 +1980,11 @@ def _build_sync_delta(
     for did, device in current_devices.items():
         old_device = previous_devices[did]
         if old_device["online"] != device["online"]:
-            online_changes.append({"did": did, "value": device["online"]})
+            online_changes.append({
+                "did": did,
+                "previous_value": old_device["online"],
+                "value": device["online"],
+            })
 
         old_properties = old_device["properties"]
         properties = device["properties"]
@@ -1946,6 +1998,8 @@ def _build_sync_delta(
                 "did": did,
                 "siid": prop["siid"],
                 "piid": prop["piid"],
+                "previous_value": old_prop["value"],
+                "previous_code": 0 if old_prop["error"] is None else -1,
                 "value": prop["value"],
                 "code": 0 if prop["error"] is None else -1,
             })
@@ -1956,6 +2010,70 @@ def _build_sync_delta(
     if property_changes:
         changes.append({"method": "properties_changed", "params": property_changes})
     return changes, False
+
+
+def _merge_sync_events(
+    base_revision: int,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Coalesce a continuous event range without changing MIoT methods."""
+
+    online: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    properties: OrderedDict[tuple[str, int, int], dict[str, Any]] = OrderedDict()
+    for event in events:
+        for change in event.get("changes", []):
+            method = change.get("method")
+            for param in change.get("params", []):
+                if method == "device_online_changed":
+                    key = str(param.get("did", ""))
+                    merged = dict(param)
+                    if key in online:
+                        merged["previous_value"] = online[key].get("previous_value")
+                    online[key] = merged
+                    online.move_to_end(key)
+                elif method == "properties_changed":
+                    key = (
+                        str(param.get("did", "")),
+                        int(param.get("siid", 0)),
+                        int(param.get("piid", 0)),
+                    )
+                    merged = dict(param)
+                    if key in properties:
+                        merged["previous_value"] = properties[key].get("previous_value")
+                        merged["previous_code"] = properties[key].get("previous_code")
+                    properties[key] = merged
+                    properties.move_to_end(key)
+
+    online = OrderedDict(
+        (key, value) for key, value in online.items()
+        if value.get("previous_value") != value.get("value")
+    )
+    properties = OrderedDict(
+        (key, value) for key, value in properties.items()
+        if (
+            value.get("previous_value") != value.get("value")
+            or value.get("previous_code") != value.get("code")
+        )
+    )
+
+    changes = []
+    if online:
+        changes.append({
+            "method": "device_online_changed",
+            "params": list(online.values()),
+        })
+    if properties:
+        changes.append({
+            "method": "properties_changed",
+            "params": list(properties.values()),
+        })
+    return {
+        "base_revision": base_revision,
+        "revision": int(events[-1]["revision"]),
+        "generated_at": int(events[-1]["generated_at"]),
+        "resync_required": False,
+        "changes": changes,
+    }
 
 
 def create_app(config: ServerConfig) -> FastAPI:
@@ -2406,13 +2524,23 @@ def create_app(config: ServerConfig) -> FastAPI:
         _: None = Depends(request_slot),
     ):
         timeout = max(1, min(10, timeout))
+        if not session.is_unlocked:
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail="当前会话已锁定，请先解锁",
+            )
         deadline = time.monotonic() + timeout
         stale = False
 
         revision, event, resync_required = session.get_sync_event_after(max(0, after))
         if resync_required:
             return {
-                "revision": revision,
+                "base_revision": max(0, after),
+                # A restarted worker has a fresh local revision counter.  The
+                # client discards this response and immediately requests a
+                # snapshot, so keep the handshake monotonic for older panels.
+                "revision": max(revision, max(0, after)),
+                "server_revision": revision,
                 "generated_at": int(time.time()),
                 "resync_required": True,
                 "changes": [],
@@ -2444,7 +2572,10 @@ def create_app(config: ServerConfig) -> FastAPI:
         if event is not None:
             return {**event, "timed_out": False, "stale": stale}
         return {
-            "revision": revision,
+            "base_revision": max(0, after),
+            "revision": max(revision, max(0, after))
+                        if resync_required else revision,
+            "server_revision": revision,
             "generated_at": int(time.time()),
             "resync_required": resync_required,
             "changes": [],
@@ -2472,13 +2603,26 @@ def create_app(config: ServerConfig) -> FastAPI:
                 device_info=info,
                 sleep_time=0.0,
             )
-            prop = device.prop_list.get(payload.prop_name)
+            prop_name = payload.prop_name
+            prop = device.prop_list.get(prop_name)
+            if prop is None and payload.siid is not None and payload.piid is not None:
+                match = next(
+                    (
+                        (name, candidate)
+                        for name, candidate in device.prop_list.items()
+                        if candidate.method.get("siid") == payload.siid
+                        and candidate.method.get("piid") == payload.piid
+                    ),
+                    None,
+                )
+                if match is not None:
+                    prop_name, prop = match
             if prop is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="设备不支持该属性",
                 )
-            result = device.set(payload.prop_name, payload.value)
+            result = device.set(prop_name, payload.value)
             code = int(result.get("code", 0))
             accepted = code in (0, 1)
             confirmed = False
@@ -2490,7 +2634,7 @@ def create_app(config: ServerConfig) -> FastAPI:
                 confirmation = "readback-timeout"
                 while time.monotonic() < deadline:
                     try:
-                        current_value = device.get(payload.prop_name)
+                        current_value = device.get(prop_name)
                         if current_value == payload.value:
                             confirmed = True
                             confirmation = "cloud-readback"
@@ -2505,7 +2649,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             session.invalidate_sync_snapshot()
             return {
                 "did": payload.did,
-                "prop_name": payload.prop_name,
+                "prop_name": prop_name,
                 "value": payload.value,
                 "method": "set_properties",
                 "siid": prop.method["siid"],
