@@ -1757,6 +1757,19 @@ def classify_device_type(device: dict[str, Any]) -> str:
     return "device"
 
 
+def _resolve_device_property(device: Any, prop_name: str,
+                             siid: Optional[int], piid: Optional[int]):
+    """Resolve explicit MIoT instance IDs before the display property name."""
+
+    if siid is not None and piid is not None:
+        for name, candidate in device.prop_list.items():
+            method = candidate.method
+            if (int(method.get("siid", -1)) == siid and
+                    int(method.get("piid", -1)) == piid):
+                return name, candidate
+    return prop_name, device.prop_list.get(prop_name)
+
+
 def build_family_snapshot(session: ManagedSession) -> dict[str, Any]:
     """Build one consistent, board-friendly view of the Mijia account."""
 
@@ -2603,20 +2616,9 @@ def create_app(config: ServerConfig) -> FastAPI:
                 device_info=info,
                 sleep_time=0.0,
             )
-            prop_name = payload.prop_name
-            prop = device.prop_list.get(prop_name)
-            if prop is None and payload.siid is not None and payload.piid is not None:
-                match = next(
-                    (
-                        (name, candidate)
-                        for name, candidate in device.prop_list.items()
-                        if candidate.method.get("siid") == payload.siid
-                        and candidate.method.get("piid") == payload.piid
-                    ),
-                    None,
-                )
-                if match is not None:
-                    prop_name, prop = match
+            prop_name, prop = _resolve_device_property(
+                device, payload.prop_name, payload.siid, payload.piid
+            )
             if prop is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,

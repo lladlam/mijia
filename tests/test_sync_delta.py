@@ -7,6 +7,7 @@ from mijiaAPI.api_server import (
     ManagedSession,
     _build_sync_delta,
     _merge_sync_events,
+    _resolve_device_property,
 )
 
 
@@ -40,6 +41,21 @@ def _event(base, revision, changes, *, resync=False):
 
 
 class SyncDeltaTests(unittest.TestCase):
+    def test_property_resolution_prefers_explicit_miot_ids(self):
+        class Property:
+            def __init__(self, siid, piid):
+                self.method = {"siid": siid, "piid": piid}
+
+        class Device:
+            prop_list = {
+                "on": Property(2, 1),
+                "secondary-on": Property(3, 1),
+            }
+
+        name, prop = _resolve_device_property(Device(), "on", 3, 1)
+        self.assertEqual(name, "secondary-on")
+        self.assertEqual(prop.method, {"siid": 3, "piid": 1})
+
     def test_unchanged_state_has_no_delta(self):
         changes, resync = _build_sync_delta(_state(), _state())
         self.assertEqual(changes, [])
